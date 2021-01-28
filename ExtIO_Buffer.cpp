@@ -6,6 +6,9 @@
 #include <string>
 #include <stdexcept>
 #include <stdint.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 // [Start of generated code block]
 // Pointer function variables
@@ -44,22 +47,35 @@ pfnExtIoSetSetting x_ExtIoSetSetting;
 pfnExtIOCallback appCallback;
 
 HINSTANCE extIO;
-int bufferMultiplier = 1;
+unsigned int bufferMultiplier = 1;
+unsigned int totalBuffers = 1;
 int xIqPairsPerCall = 0;
 int bufferIqPairsPerCall = 0;
 int hwTypeReported = 0;
 void* buffer;
 unsigned int bufferIndex = 0;
+unsigned int bufferHead = 0;
+unsigned int bufferTail = 0;
 size_t bufferSize;
 BOOL buffering = FALSE;
-int bytesPerCallback = 0;
+unsigned int bytesPerCallback = 0;
+unsigned int bytesPerBufferEntry;
+std::mutex appCallbackMutex;
+std::condition_variable bufferUpdate;
+
+BOOL stopBufferThread = FALSE;
+BOOL bufferThreadRunning = FALSE;
+std::thread bufferThread;
 
 BOOL debug = TRUE;
+BOOL crazyDebug = FALSE;
 int appHits = 0;
+int bufferOverruns = 0;
 
 BOOL dllInit() {
     BOOL retVal = FALSE;
     std::wstring cfgBufferMultiplier;
+    std::wstring cfgTotalBuffers;
 
     if (debug) std::cout << "[ExtIO_Buffer] dllInit" << std::endl;
 
@@ -77,6 +93,21 @@ BOOL dllInit() {
         catch (const std::invalid_argument& ia) {
             (void)ia;
             std::cerr << "[ExtIO_Buffer] Buffer multiplier not valid" << std::endl;
+            cfgFile.close();
+            return FALSE;
+        }
+
+        if (!getline(cfgFile, cfgTotalBuffers)) {
+            std::cerr << "[ExtIO_Buffer] Total buffers not found in ExtIO_Buffer.cfg" << std::endl;
+            cfgFile.close();
+            return FALSE;
+        }
+        try {
+            totalBuffers = std::stoi(cfgTotalBuffers);
+        }
+        catch (const std::invalid_argument& ia) {
+            (void)ia;
+            std::cerr << "[ExtIO_Buffer] Total buffers not valid" << std::endl;
             cfgFile.close();
             return FALSE;
         }
@@ -146,6 +177,41 @@ void dllExit() {
     }
 }
 
+void bufferThreadFunction() {
+    std::mutex mtx;
+    std::unique_lock<std::mutex> lck(mtx);
+
+    if (debug) std::cout << "[ExtIO_Buffer] Buffer Thread Start" << std::endl;
+
+    bufferThreadRunning = TRUE;
+
+    while (!stopBufferThread) {
+        bufferUpdate.wait_for(lck, std::chrono::seconds(1));
+        while (bufferTail != bufferHead) {
+            if (crazyDebug) std::cout << "B";
+            uint8_t* buf = (uint8_t*)buffer + (bufferTail * bytesPerBufferEntry);
+            appHits++;
+            int retVal;
+            appCallbackMutex.lock();
+            retVal = appCallback(bytesPerBufferEntry, 0, 0.0, (void*)buf);
+            appCallbackMutex.unlock();
+            //if (retVal != 0) {
+            //    std::cerr << "[ExtIO_Buffer] Callback returned error " << retVal << std::endl;
+            //}
+            unsigned int tempTail = bufferTail + 1;
+            if (tempTail >= totalBuffers) {
+                tempTail = 0;
+            }
+            bufferTail = tempTail;
+        }
+    }
+
+    bufferThreadRunning = FALSE;
+
+    if (debug) std::cout << "[ExtIO_Buffer] Buffer Thread Exit" << std::endl;
+
+}
+
 int createBuffer() {
     if (debug) std::cout << "[ExtIO_Buffer] Original IQ pairs per call = " << xIqPairsPerCall << std::endl;
 
@@ -178,15 +244,23 @@ int createBuffer() {
 
     if (bytesPerPair != 0) {
         bytesPerCallback = bytesPerPair * xIqPairsPerCall;
-        bufferSize = (size_t)(bytesPerPair * bufferIqPairsPerCall);
+        bytesPerBufferEntry = bytesPerPair * bufferIqPairsPerCall;
+        bufferSize = (size_t)(totalBuffers * bytesPerBufferEntry);
         buffer = malloc(bufferSize);
         if (!buffer) {
             std::cerr << "[ExtIO_Buffer] Could not allocate buffer" << std::endl;
             buffering = FALSE;
         }
         else {
-            buffering = TRUE;
+            if (debug) std::cout << "[ExtIO_Buffer] Buffer multiplier = " << bufferMultiplier << std::endl;
+            if (debug) std::cout << "[ExtIO_Buffer] Total buffers = " << totalBuffers << std::endl;
+            if (debug) std::cout << "[ExtIO_Buffer] Bytes per callback = " << bytesPerCallback << std::endl;
+            if (debug) std::cout << "[ExtIO_Buffer] Bytes per buffer entry = " << bytesPerBufferEntry << std::endl;
             if (debug) std::cout << "[ExtIO_Buffer] Buffer size (bytes) = " << bufferSize << std::endl;
+
+            stopBufferThread = FALSE;
+            bufferThread = std::thread(bufferThreadFunction);
+            buffering = TRUE;
         }
     }
     else {
@@ -195,10 +269,12 @@ int createBuffer() {
     }
 
     // Return the new iqPairs per call
-    if (buffering)
+    if (buffering) {
         return bufferIqPairsPerCall;
-    else
+    }
+    else {
         return xIqPairsPerCall;
+    }
 }
 
 int bufferCallback(int cnt, int status, float IQoffs, void* IQdata) {
@@ -206,17 +282,31 @@ int bufferCallback(int cnt, int status, float IQoffs, void* IQdata) {
         // buffer, then call if full
         if (cnt > 0) {
             // Data
-            uint8_t* buf = (uint8_t*)buffer;
-            memcpy(&buf[bufferIndex], IQdata, bytesPerCallback);
-            bufferIndex += bytesPerCallback;
-            if (bufferIndex >= bufferSize) {
-                bufferIndex = 0;
-                appHits++;
-                return appCallback(bufferIqPairsPerCall, status, IQoffs, buffer);
+            if (bufferThreadRunning) {
+                uint8_t* buf = (uint8_t*)buffer + (bufferHead * bytesPerBufferEntry);
+                memcpy(&buf[bufferIndex], IQdata, bytesPerCallback);
+                bufferIndex += bytesPerCallback;
+                if (crazyDebug) std::cout << ".";
+                if (bufferIndex >= bytesPerBufferEntry) {
+                    bufferIndex = 0;
+                    unsigned int tempHead = bufferHead + 1;
+                    if (tempHead >= totalBuffers) {
+                        tempHead = 0;
+                    }
+                    if (tempHead == bufferTail) {
+                        bufferOverruns++;
+                        if (crazyDebug) std::cout << "o";
+                        else std::cerr << "[ExtIO_Buffer] Buffer overrun" << std::endl;
+                        tempHead = bufferHead;
+                    }
+                    else {
+                        if (crazyDebug) std::cout << "b";
+                    }
+                    bufferHead = tempHead;
+                    bufferUpdate.notify_one();
+                }
             }
-            else {
-                return 0;
-            }
+            return 0;
         }
         else {
             // Info
@@ -230,14 +320,25 @@ int bufferCallback(int cnt, int status, float IQoffs, void* IQdata) {
             //                , extHw_SampleFmt_IQ_INT32 = 129   //           -"-           signed 32 bit INT
             //                , extHw_SampleFmt_IQ_FLT32 = 130   //           -"-           signed 16 bit FLOAT
 
-            return appCallback(cnt, status, IQoffs, IQdata);
+            int retVal;
+            appCallbackMutex.lock();
+            if (crazyDebug) std::cout << "i";
+            retVal =  appCallback(cnt, status, IQoffs, IQdata);
+            appCallbackMutex.unlock();
+            return retVal;
         }
     }
     else {
         // just call the app callback as is
-        return appCallback(cnt, status, IQoffs, IQdata);
+        int retVal;
+        appCallbackMutex.lock();
+        if (crazyDebug) std::cout << "x";
+        retVal = appCallback(cnt, status, IQoffs, IQdata);
+        appCallbackMutex.unlock();
+        return retVal;
     }
 }
+
 
 // Create cross DLL calls
 
@@ -278,12 +379,17 @@ void __stdcall CloseHW(void) {
 int __stdcall StartHW(long extLOfreq) {
 
 	xIqPairsPerCall = x_StartHW(extLOfreq);
+	stopBufferThread = FALSE;
 	return(createBuffer());
 }
+
 void __stdcall StopHW(void) {
+	if (buffering) {
+		stopBufferThread = TRUE;
+		bufferThread.join();
+	}
 	return x_StopHW();
 }
-
 
 void __stdcall SetCallback(pfnExtIOCallback funcptr) {
 	// intercept callback functions with our own
@@ -334,6 +440,7 @@ void __stdcall ModeChanged(char mode) {
 
 int __stdcall StartHW64(int64_t extLOfreq) {
 	xIqPairsPerCall = x_StartHW64(extLOfreq);
+	stopBufferThread = FALSE;
 	return(createBuffer());
 }
 int64_t __stdcall SetHWLO64(int64_t extLOfreq) {

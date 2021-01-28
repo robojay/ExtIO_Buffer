@@ -46,9 +46,20 @@ StartHWfnCall = """
 int __stdcall StartHW(long extLOfreq) {
 
 	xIqPairsPerCall = x_StartHW(extLOfreq);
+	stopBufferThread = FALSE;
 	return(createBuffer());
 }
 """		
+
+StopHWfnCall = """
+void __stdcall StopHW(void) {
+	if (buffering) {
+		stopBufferThread = TRUE;
+		bufferThread.join();
+	}
+	return x_StopHW();
+}
+"""
 
 SetCallbackfnCall = """
 void __stdcall SetCallback(pfnExtIOCallback funcptr) {
@@ -62,6 +73,7 @@ void __stdcall SetCallback(pfnExtIOCallback funcptr) {
 StartHW64fnCall = """
 int __stdcall StartHW64(int64_t extLOfreq) {
 	xIqPairsPerCall = x_StartHW64(extLOfreq);
+	stopBufferThread = FALSE;
 	return(createBuffer());
 }
 """		
@@ -69,6 +81,7 @@ int __stdcall StartHW64(int64_t extLOfreq) {
 StartHW_dblfnCall = """
 int __stdcall StartHW_dbl(double extLOfreq) {
 	xIqPairsPerCall = x_StartHW_dbl(extLOfreq);
+	stopBufferThread = FALSE;
 	return(createBuffer());
 }
 """
@@ -184,6 +197,8 @@ for i in range(1, len(pfnNames)):
 			fnCall = InitHWfnCall
 		elif callNames[i] == 'StartHW':
 			fnCall = StartHWfnCall
+		elif callNames[i] == 'StopHW':
+			fnCall = StopHWfnCall
 		elif callNames[i] == 'SetCallback':
 			fnCall = SetCallbackfnCall
 		elif callNames[i] == 'StartHW64':
